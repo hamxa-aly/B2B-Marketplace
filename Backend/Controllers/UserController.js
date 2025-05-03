@@ -1,0 +1,259 @@
+const userModel = require("../Schemas/users");
+const sellerModel = require("../Schemas/Seller");
+const StoreModel = require("../Schemas/Store");
+const CartModel = require("../Schemas/Cart");
+const passwordResetModels = require('../Schemas/PasswordResetTokens');
+const jwt = require("jsonwebtoken");
+require('dotenv').config();
+const crypto = require('crypto');
+const transporter = require('../config/NodeMailerTransporter');
+
+module.exports = {
+    Signup: async (req, res) => {
+        try {
+            console.log(req.body);
+            
+            const { Name, password, username, Email, Phone } = req.body;
+    
+            if (!Name || !password || !username || !Email || !Phone) {
+                return res.status(400).json({ error: "All fields are required." });
+            }
+    
+            const user = await userModel.create({
+                Name,
+                password,
+                username,
+                Email,
+                Phone,
+            });
+    
+            if (user) {
+
+                const cart = await CartModel.create({user: user._id});
+                if(cart){
+                    user.Cart = cart;
+                    await user.save();
+                }
+                else{
+                    return res.status(500).json({error: "Internal Server error!"});
+                }
+                return res.status(200).json({ message: "User created successfully!", user });
+            }
+    
+            // Handle unexpected failure to create the user
+            return res.status(500).json({ error: "Failed to create user." });
+        } catch (error) {
+            if (error.code === 11000) {
+                const field = Object.keys(error.keyValue)[0];
+                return res.status(400).json({ error: `${field} already exists.` });
+            }
+            console.error(error); 
+            return res.status(500).json({ error: "An unexpected error occurred!" });
+        }
+    },
+
+    Login: async(req,res) => {
+        try {
+            const { email, password } = req.body;
+            
+        const user = await userModel.findOne({Email: email});
+    
+        if(!user){
+            return res.status(401).json({error: "Invalid Email or Password"});
+        }
+            const isValidPassword = await user.validatePassword(password);
+    
+        if(!isValidPassword){
+            return res.status(401).json({error: "Invalid Email or Password"});
+        }
+
+        var hasStore = false;
+
+        const seller = await sellerModel.findOne({AssociatedBuyerAccountEmail: user.Email});
+        if(seller){
+            const store = await StoreModel.findOne({StoreOwner: seller});
+            if(store)
+            hasStore = true;
+        }
+        
+        const token = jwt.sign({userId: user._id ,userEmail: user.Email , userName: user.Name, userRole: user.role}, process.env.SECRET_KEY, {expiresIn: "2 days"});
+        res.status(200).json({token, role: user.role , storeStatus: hasStore});
+        } catch (error) {
+            console.log(error);
+            res.status(500).json({error: "An error occurred while logging in!"});
+        }
+    },
+
+    GetUserRoleAndStoreStatus : async (req, res) => {
+
+        try {
+            var hasStore = false;
+            var role =  "buyer";
+            const seller = await sellerModel.findOne({AssociatedBuyerAccountEmail: req.user.userEmail});
+            if(seller){
+                role = "seller";
+                const store = await StoreModel.findOne({StoreOwner: seller});
+            if(store)
+            hasStore = true;
+
+            return res.status(200).json({userRole: role, storeStatus: hasStore});
+        }
+        } catch (error) {
+            return res.status(500).json({error: "An error occurred while fetching user role and store status!"});
+        }        
+    },
+
+    GetProfile: (req,res) => {
+        return res.status(200).json({message: `Welcome ${req.user.userName}!`});
+    },
+
+    ForgotPasswordRequest: async (req, res) => {
+        const email = req.body.email;
+        if (!email) {
+            return res.status(400).json({ error: "No Email provided" });
+        }
+    
+        let url = null;
+        let randomUserId = null;  // Declare outside the try block so it's accessible in case of an error
+        let user = null;
+        try {
+            user = await userModel.findOne({ Email: email });
+            const resetToken = crypto.randomBytes(64).toString('hex');
+            
+            if (!user) {
+                console.log("User not found!");
+                // Generate a random userId if no user is found
+                randomUserId = crypto.randomBytes(64).toString('hex');
+                console.log("Random user id: " + randomUserId);
+                url = `http://localhost:3000/users/resetPassword/${randomUserId}/${resetToken}`;
+            } else {
+                console.log("User found!");
+                // Create token hash
+                const hash = crypto.createHash('sha256');
+                hash.update(resetToken);
+                const digest = hash.digest('hex');
+    
+                // Create a password reset document 
+                //if already existing, update it
+                //if not exits, then it will create
+                //ensuring that any moment, a single user have single password reset token
+                await passwordResetModels.findOneAndUpdate(
+                    { userId: user._id }, 
+                    { 
+                      userId: user._id,     
+                      TokenHash: digest,    
+                      createdAt: Date.now(),
+                    },
+                    { 
+                      new: true,          
+                      upsert: true,       
+                      runValidators: true 
+                    }
+                  );
+    
+                url = `http://localhost:3000/resetPassword/${user._id}/${resetToken}`;
+            }
+        } catch (error) {
+            console.log("Error occurred while generating password reset link:", error);
+            
+            // Cleanup if document was created
+            if (randomUserId == null) {
+                // If random userId was generated, no document was created in the database
+                // Otherwise, delete the document created earlier
+                try {
+                    await passwordResetModels.deleteOne({ userId: randomUserId });
+                } catch (err) {
+                    console.log("Error occurred while cleaning up document:", err);
+                }
+            }
+            return res.status(500).json({ error: "Error generating password reset link" });
+        }
+    
+        try {
+            const info = await transporter.sendMail({
+                from: "solo.developer29@gmail.com",
+                to: `${randomUserId ? email : user.Email}`,  // If user exists, use email from database; else use entered email
+                subject: "Password Reset Request for Your Karoobar Account",
+                text: `Dear User,
+    
+                We received a request to reset your password for your Karoobar account. To proceed, please click the link below to create a new password:
+    
+                ${url}
+    
+                For your security, this link will expire in 10 minutes. If you didn’t request a password reset, please disregard this email. Your account remains secure, and no changes will be made.
+    
+                If you need further assistance, feel free to reach out to our support team at support@karoobar.com.
+    
+                Best regards,  
+                The Karoobar Team`,
+                html: `
+                    <p>Dear User,</p>
+                    <p>We received a request to reset your password for your Karoobar account. To proceed, please click the link below to create a new password:</p>
+                    <p><a href="${url}">Reset Your Password</a></p>
+                    <p>For your security, this link will expire in 10 minutes. If you didn’t request a password reset, please disregard this email—your account remains secure, and no changes will be made.</p>
+                    <p>If you need further assistance, feel free to reach out to our support team at <a href="mailto:support@karoobar.com">support@karoobar.com</a>.</p>
+                    <br>
+                    <p>Best regards,</p>
+                    <p>The Karoobar Team</p>
+                    <br>
+                    <p style="font-size: small; color: gray;">*This is an automated message. Please do not reply directly to this email.*</p>`
+            });
+            console.log("Message ID:", info.messageId);
+            res.status(200).json({ response: "Message sent successfully!" });
+        } catch (error) {
+            console.log("Error while sending email:", error);
+            
+            // Cleanup if document was created
+            try {
+                await passwordResetModels.deleteOne({ userId: randomUserId });
+            } catch (err) {
+                console.log("Error occurred while cleaning up document:", err);
+            }
+            
+            return res.status(500).json({ error: "Failed to send email." });
+        }
+    },
+
+    ResetPassword: (req, res) => {
+        // If the token is valid, show a reset password form or success message
+        res.send("Welcome to Reset Password!");
+    },
+
+    RegisterAsSeller: async(req,res) => {
+        const {businessEmail, IBAN, NTN, CNIC} = req.body;
+    
+        if(!businessEmail || !IBAN || !NTN || !CNIC){
+            return res.status(400).json({error: "A required field is empty"});
+        }    
+
+        const user = await userModel.findOne({Email: req.user.userEmail});
+        if(!user){
+            return res.status(400).json({error: "User not found!"});
+        }
+        try {
+            const seller = await sellerModel.create({BusinessEmail: req.body.businessEmail,
+            AssociatedBuyerAccountEmail: req.user.userEmail,
+            CNIC: req.body.CNIC,
+            NTN: req.body.NTN,
+            IBAN: req.body.IBAN,
+        })
+        user.role = 'seller';
+        await user.save();
+        return res.status(200).json({message: "Thanks for submitting the Seller Registration form!\nWe have recieved your request. Your applicaiton is currently in pending Status.\nApplication's status will be updated within 24 hours."})
+        } catch (error) {
+           return res.send(500).json({error: "An error occurred while submitting the form!\n Apologies for the inconvenience! Please try again later."})
+        }
+        
+    },
+
+    GetSellerAccountStatus: async (req,res) => {
+        const sellerAccount = await sellerModel.findOne({AssociatedBuyerAccountEmail: req.user.userEmail});
+
+        if(sellerAccount){
+            return res.status(200).json({status: sellerAccount.sellerAccountStatus})
+        }
+        else{
+            return res.status(500).json({status:"Account not found!"});
+        }
+    },
+}
